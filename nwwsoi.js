@@ -69,6 +69,8 @@ filterAlertsOnStartup();
 // Helper: build alert name from phenomena and significance codes
 function buildAlertNameFromVtec(phenomCode, significanceCode) {
     if (!phenomCode || !significanceCode) return null;
+    // Special-case: Red Flag Warning uses phenomenon FW with significance W
+    if (phenomCode === 'FW' && significanceCode === 'W') return 'Red Flag Warning';
     
     // Look up phenomenon name from phenomena.json
     const phenomEntry = phenomena[phenomCode];
@@ -84,6 +86,28 @@ function buildAlertNameFromVtec(phenomCode, significanceCode) {
     
     const label = significanceMap[significanceCode] || significanceCode;
     return `${phenomEntry.name} ${label}`;
+}
+
+            // formatMessageNewlines is hoisted to top-level (see earlier in file)
+
+// If invoked directly with --test-format, run a small test and exit.
+if (require.main === module && process.argv.includes('--test-format')) {
+    const samples = [
+        '...FLASH FLOOD WARNING REMAINS IN EFFECT UNTIL 1245 PM HST THIS AFTERNOON FOR THE ISLAND OF OAHU IN HONOLULU COUNTY...',
+        '...FLASH FLOOD WARNING REMAINS IN EFFECT UNTIL 1245 PM HST THIS AFTERNOON FOR THE ISLAND OF OAHU IN HONOLULU COUNTY...\nMore text',
+        'PREAMBLE ...FLASH FLOOD WARNING REMAINS...',
+        'PREAMBLE...FLASH FLOOD WARNING REMAINS...',
+        '... FLASH FLOOD WARNING REMAINS...',
+        'Some text...FLASH FLOOD WARNING...'
+    ];
+    for (const s of samples) {
+        console.log('--- ORIGINAL ---');
+        console.log(s);
+        console.log('--- FORMATTED ---');
+        console.log(formatMessageNewlines(s));
+        console.log('\n');
+    }
+    process.exit(0);
 }
 
 (async () => {
@@ -243,7 +267,7 @@ function buildAlertNameFromVtec(phenomCode, significanceCode) {
         // Join the NWWS chat room
         try {
             xmpp.send(
-                xml('presence', { to: 'nwws@conference.nwws-oi.weather.gov/SparkRadar' })
+                xml('presence', { to: 'nwws@conference.nwws-oi.weather.gov/Warnverlay' })
             );
         } catch (err) {
             // If there is an error joining, log and try again
@@ -519,17 +543,28 @@ Louisiana out 20 to 60 NM-`;
                         // Prepend any original preamble (e.g., 194\n\nXOUS54 KWBC 311944\n\nCAPLIX\n\n)
                         const preambleMatch = rawText.match(/^[\s\S]*?(?=<\?xml)/);
                         let finalMsg = (preambleMatch ? preambleMatch[0] : '') + cleanedMsg;
+                      
+                        // If the preamble contains a WMO/CAP header like
+                        //   "316 XOUS53 KWBC 222002 CAPJKL"
+                        // normalize it into separate lines for the minimal cleanup path so the
+                        // resulting object message preserves the preamble layout.
+                        // Result: "316\nXOUS53 KWBC 222002\nCAPJKL\n\n"
+                        finalMsg = finalMsg.replace(/^\s*(\d{1,4})\s+([A-Z0-9]{3,8})\s+([A-Z0-9]{3,8})\s+(\d{3,6})\s+(CAP[A-Z0-9-]*)\s*/m, '$1\n$2 $3 $4\n$5\n\n');
 
                         // Normalize paragraphs (preserve paragraph breaks; join wrapped lines)
                         finalMsg = normalizeParagraphs(finalMsg);
                         if (capNwsHeadline) {
+                            // collapse any remaining newlines in the headline so it renders as a single line
+                            capNwsHeadline = capNwsHeadline.replace(/\r?\n+/g, ' ').trim();
+
                             // remove leading occurrence of the headline from the message body
                             const re = new RegExp('^' + capNwsHeadline.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\s*\\n?', 'i');
                             if (/\/O\..*?\/\n?/.test(rawText) || /<parameter>\s*<valueName>VTEC<\/valueName>/i.test(rawText)) finalMsg = finalMsg.replace(re, '').trim();
                         }
 
-                        // Replace message in parsedAlert/message
+                        // Replace message in parsedAlert/message and mark minimal CAP cleanup
                         rawText = finalMsg;
+                        capMinimalCleanup = true;
                     });
                     // Normalize the full rawText after CAP cleanup to convert escape sequences and clean structure
                     rawText = formatMessageNewlines(rawText);
@@ -671,10 +706,43 @@ Louisiana out 20 to 60 NM-`;
 
                             // --- Preserve preamble and UGC line ---
                             // Find preamble before CAP XML (e.g., "552\nWWUS83 KLMK 061958\nSPSLMK.")
+
                             const preambleMatch = rawText.match(/^([\s\S]*?)(?=<\?xml)/);
                             let preamble = preambleMatch ? preambleMatch[1].trim() : '';
 
-
+                            // Split the preamble/header into individual lines for NWWS-OI format
+                            if (preamble) {
+                                // Try to match the typical NWWS-OI header pattern: digits, product code, WMO, AWIPS, etc.
+                                // Example: "271 XOUS54 KWBC 211952 CAPMOB"
+                                const headerRegex = /^(\d{3})\s+([A-Z]{6})\s+([A-Z]{4} \d{6} [A-Z]{6})/;
+                                const headerMatch = preamble.match(headerRegex);
+                                if (headerMatch) {
+                                    // Split header into parts. If the 3rd capture contains an extra
+                                    // trailing product token (e.g. "KWBC 221334 CAPBGM"), move
+                                    // that trailing token to its own line so the header becomes:
+                                    // 514
+                                    // XOUS51 KWBC 221334
+                                    // CAPBGM
+                                    let headerParts;
+                                    const third = (headerMatch[3] || '').trim();
+                                    const thirdParts = third.split(/\s+/).filter(Boolean);
+                                    if (thirdParts.length > 2) {
+                                        const tail = thirdParts.pop();
+                                        const rest = thirdParts.join(' ');
+                                        headerParts = [headerMatch[1], headerMatch[2] + (rest ? ' ' + rest : ''), tail];
+                                    } else {
+                                        headerParts = [headerMatch[1], headerMatch[2], headerMatch[3]];
+                                    }
+                                    // Remove header from preamble
+                                    preamble = preamble.replace(headerRegex, '').trim();
+                                    // If there is any remaining preamble, split by double newlines
+                                    let preambleLines = preamble ? preamble.split(/\n{2,}/).map(l => l.trim()).filter(Boolean) : [];
+                                    preamble = headerParts.join('\n') + '\n\n' + preambleLines.join('\n');
+                                } else {
+                                    // Fallback: split by spaces for generic header
+                                    preamble = preamble.split(/\s+/).join('\n');
+                                }
+                            }
 
                             const event = extractText(info.event);
 
@@ -783,7 +851,12 @@ Louisiana out 20 to 60 NM-`;
                             // Clean areaDesc: replace semicolons/commas/newlines with hyphens and ensure trailing '-'
                             let areaDesc = extractText(info.area && info.area.areaDesc);
                             if (areaDesc) {
+                                // Replace semicolons/commas/newlines with hyphens and remove
+                                // any spaces around hyphens so we keep compact tokens like
+                                // "Sullivan-Bradford-Susquehanna-..."
                                 areaDesc = areaDesc.replace(/[;,]/g, '-').replace(/\s*\n\s*/g, '-').replace(/\s+/g, ' ').trim();
+                                // remove spaces around hyphens
+                                areaDesc = areaDesc.replace(/\s*-\s*/g, '-');
                                 areaDesc = areaDesc.replace(/-+/g, '-').replace(/^[-\s]+|[-\s]+$/g, '');
                                 if (areaDesc.length) areaDesc = areaDesc + '-';
                             }
@@ -823,7 +896,11 @@ Louisiana out 20 to 60 NM-`;
                                     if (info.parameter) {
                                         const params = Array.isArray(info.parameter) ? info.parameter : [info.parameter];
                                         const nh = params.find(p => p.valueName && String(p.valueName).toUpperCase() === 'NWSHEADLINE');
-                                        if (nh) capNwsHeadline = extractText(nh.value);
+                                        if (nh) {
+                                        capNwsHeadline = extractText(nh.value);
+                                        // headline parameters often contain stray newlines; collapse them and trim
+                                        capNwsHeadline = capNwsHeadline.replace(/\r?\n+/g, ' ').trim();
+                                    }
                                     }
 
                                     // populate eventTrackingNumber fallback from CAP identifier or info/eventTrackingNumber param
@@ -879,9 +956,24 @@ Louisiana out 20 to 60 NM-`;
                             if (event) minimalParts.push(formatMessageNewlines(event));
                             if (sender) minimalParts.push(formatMessageNewlines(sender));
                             if (sent) minimalParts.push(formatMessageNewlines(formatIssuedTime(sent)));
-                            if (ugcLine) minimalParts.push(formatMessageNewlines(ugcLine));
+                            if (ugcLine) {
+                                const fu = formatMessageNewlines(ugcLine);
+                                // preserve an extra newline after the UGC code line so the following
+                                // content starts on the next line
+                                minimalParts.push(fu + '\n');
+                            }
                             if (areaDesc) minimalParts.push(formatMessageNewlines(areaDesc));
-                            if (capNwsHeadline) minimalParts.push(formatMessageNewlines(capNwsHeadline));
+                            if (capNwsHeadline) {
+                                // Ensure headline is surrounded by exactly two newlines for non-VTEC CAP
+                                // cleanup, but do not double-wrap if it's already wrapped with two newlines.
+                                let fh = formatMessageNewlines(capNwsHeadline || '');
+                                const hasTwo = fh.startsWith('\n\n') && fh.endsWith('\n\n');
+                                if (!hasTwo) {
+                                    // strip existing leading/trailing newlines then wrap
+                                    fh = '\n\n' + fh.replace(/^\n+|\n+$/g, '') + '\n\n';
+                                }
+                                minimalParts.push(fh);
+                            }
                             if (description) minimalParts.push(formatMessageNewlines(description));
                             if (instruction) minimalParts.push(formatMessageNewlines(instruction));
 
@@ -1069,6 +1161,9 @@ Louisiana out 20 to 60 NM-`;
                             if (minimalParts.length) {
                                 // join parts with double-newlines so that normalizeParagraphs treats them as separate
                                 rawText = minimalParts.join('\n\n') + '\n';
+                                // mark that we performed a non-VTEC minimal CAP cleanup so callers
+                                // later will NOT split the message into multiple parts
+                                capMinimalCleanup = true;
                                 // normalize newlines (convert escaped sequences and clean structure) first
                                 rawText = formatMessageNewlines(rawText);
                                 // then normalize paragraphs (preserve paragraph breaks; join wrapped lines)
@@ -1286,22 +1381,20 @@ Louisiana out 20 to 60 NM-`;
                 text = text.replace(/^\n{3,}/, '\n\n');
                 // remove leading/trailing spaces but keep newlines
                 text = text.replace(/^[ \t]+|[ \t]+$/g, '');
-                // collapse 3+ blank lines into 2
-                text = text.replace(/\n{3,}/g, '\n\n');
-                // split paragraphs on one-or-more blank lines, join wrapped lines inside each paragraph
-                // EXCEPTION: preserve a single newline that precedes a timestamp so the time stays on its own line
+                // collapse 2+ blank lines into 2
+                text = text.replace(/\n{2,}/g, '\n\n');
+                // split paragraphs on two or more blank lines, join wrapped lines inside each paragraph
                 const paras = text.split(/\n{2,}/).map(p => p
                     .replace(/\n+(?=(?:At\s+)?(?:\d{3,4}|\d{1,2}(?::\d{2})?)\s*(?:AM|PM))/gi, '\n')
                     .replace(/\n+/g, ' ')
                     .trim()
                 ).filter(Boolean);
-
                 // Re-join paragraphs using a canonical paragraph separator
                 let out = paras.join('\n\n');
 
                 // Ensure delimiters '&&' and '$$' are surrounded by double-newlines
                 out = out.replace(/\s*&&\s*/g, '\n\n&&\n\n');
-                out = out.replace(/\s*\$\$\s*/g, '\n\n$$\n\n');
+                out = out.replace(/\s*\$\$\s*/g, '\n\n$$$$\n\n');
 
                 // Ensure that a delimiter '&&' is followed by a double-newline before LAT...LON
                 // handle cases with no whitespace, single newline, or multiple whitespace/newlines
@@ -1403,6 +1496,8 @@ Louisiana out 20 to 60 NM-`;
 
                 // Ensure 'Including' starts on its own line when it follows an area-desc fragment
                 out = out.replace(/-\s*(Including\b)/gi, '-\n$1');
+                // Add newline after 'Including the cities' phrase
+                out = out.replace(/(Including the cities[^\n]*?)(?=\d{1,2}:?\d{2}\s*(AM|PM)\s*[A-Z]{2,4}\s*[A-Za-z]{3}\s+\d{1,2}\s+\d{4})/gi, '$1\n');
 
                 // 9) Collapse any newlines inside an "Including ..." list (until the next paragraph) into spaces
                 //    (the "Including" heading will be on its own line due to the rule above)
@@ -1457,7 +1552,7 @@ Louisiana out 20 to 60 NM-`;
                 // Final enforcement: ensure '&&' and '$$' are surrounded by exactly two newlines
                 // This runs last so earlier replacements can't collapse these separators.
                 out = out.replace(/\n{0,2}&&\n{0,2}/g, '\n\n&&\n\n');
-                out = out.replace(/\n{0,2}\$\$\n{0,2}/g, '\n\n$$\n\n');
+                out = out.replace(/\n{0,2}\$\$\n{0,2}/g, '\n\n$$$$\n\n');
 
                 // Last-resort: if any double-newline still appears immediately before a 3- or 4-digit time
                 // (examples: "\n\n839 PM...", "\n\n1139 PM..."), collapse it to a single newline.
@@ -1486,6 +1581,12 @@ Louisiana out 20 to 60 NM-`;
                 // 2) Normalize any remaining CR/LF into \n
                 formatted = formatted.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
+                // If an uppercase headline is split across newlines inside leading/trailing ellipses,
+                // normalize it to a single headline paragraph. Examples handled:
+                //   "...\nFLASH FLOOD WARNING..."  -> "\n\n...FLASH FLOOD WARNING...\n\n"
+                //   "... FLASH\n..."                 -> "\n\n...FLASH...\n\n"
+                formatted = formatted.replace(/(\.{3,})\s*([A-Z0-9][A-Z0-9 \-\/,()'\.&]{1,200}?)\s*(\.{3,})/g, '\n\n$1$2$3\n\n');
+
                 // 3) Remove stray trailing/leading whitespace around newlines (prevents " <newline>HEADING" cases)
                 formatted = formatted.replace(/[ \t]+\n/g, '\n');
                 formatted = formatted.replace(/\n[ \t]+/g, '\n');
@@ -1494,17 +1595,24 @@ Louisiana out 20 to 60 NM-`;
                 // 4) Defensive: replace any remaining backslash+n sequences
                 formatted = formatted.replace(/\\+n/g, '\n');
 
-                // 5) Collapse runs of 3+ newlines down to exactly 2 (paragraph separation)
-                formatted = formatted.replace(/\n{3,}/g, '\n\n');
+                // 5) Collapse runs of 2+ newlines down to exactly 2 (paragraph separation)
+                formatted = formatted.replace(/\n{2,}/g, '\n\n');
 
                 // 6) Ensure exact spacing before headings that should have TWO newlines
                 const twoNL = ['HAZARD\\.\\.\\.', 'SOURCE\\.\\.\\.', 'IMPACT\\.\\.\\.', 'Locations impacted include'];
                 for (const h of twoNL) {
                     // If the heading is on the same line as previous text (possibly separated by spaces),
                     // strip those spaces and insert exactly two newlines before the heading.
-                    formatted = formatted.replace(new RegExp('([^\\n\\s])\\s*(' + h + ')', 'g'), '$1\n\n$2');
+                    // BUT: if the heading is immediately preceded by an ellipsis ("..."), do NOT insert
+                    // any newlines (preserve the '...HEADING' form).
+                    formatted = formatted.replace(new RegExp('((?:\\.{3,})|[^\\n\\s])\\s*(' + h + ')', 'g'), (m, p1, p2) => {
+                        if (/^\.{3,}/.test(p1)) return p1 + p2;
+                        return p1 + '\\n\\n' + p2;
+                    });
                     // Collapse any existing newline(s)+optional spaces before the heading to exactly two newlines
-                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\n\n$1');
+                    // (if the heading is already preceded by an ellipsis and a newline, leave as-is to avoid
+                    // inserting extra blank lines inside ellipses-containing constructs).
+                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\\n\\n$1');
                 }
 
                 // 7) Ensure exact spacing before headings that should have ONE newline
@@ -1529,9 +1637,13 @@ Louisiana out 20 to 60 NM-`;
                 ];
                 for (const h of oneNL) {
                     // If heading immediately follows text (possibly with spaces), strip spaces and insert one newline
-                    formatted = formatted.replace(new RegExp('([^\\n\\s])\\s*(' + h + ')', 'g'), '$1\n$2');
+                    // BUT: preserve '...HEADING' where an ellipsis directly precedes the heading.
+                    formatted = formatted.replace(new RegExp('((?:\\.{3,})|[^\\n\\s])\\s*(' + h + ')', 'g'), (m, p1, p2) => {
+                        if (/^\.{3,}/.test(p1)) return p1 + p2;
+                        return p1 + '\\n' + p2;
+                    });
                     // Collapse any existing newline(s)+optional spaces before the heading to exactly one newline
-                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\n$1');
+                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\\n$1');
                 }
 
                 // 8) Ensure TIME...MOT...LOC is single-lined (followed by normal spacing)
@@ -1539,8 +1651,33 @@ Louisiana out 20 to 60 NM-`;
 
                 // 9) Final pass: remove any remaining trailing spaces before newlines, collapse multiples and trim
                 formatted = formatted.replace(/[ \t]+\n/g, '\n');
-                formatted = formatted.replace(/\n{3,}/g, '\n\n');
+                formatted = formatted.replace(/\n{2,}/g, '\n\n');
                 formatted = formatted.replace(/^\s+|\s+$/g, '');
+
+                // FINAL: ensure any uppercase headline enclosed in leading+trailing ellipses
+                // does not contain internal newlines and is surrounded by blank lines.
+                // Example: "...THIS\nEVENING..." -> "\n\n...THIS EVENING...\n\n"
+                formatted = formatted.replace(/(\.{3,})\s*([\s\S]{1,300}?)\s*(\.{3,})/g, (m, lead, inner, trail) => {
+                    const collapsed = String(inner).replace(/\s*\n+\s*/g, ' ').trim();
+                    // Only transform when the interior looks like an uppercase headline (allow numbers/punct)
+                    if (/^[A-Z0-9 \-\/(),.'&]{1,300}$/.test(collapsed)) {
+                        return '\n\n' + lead + collapsed + trail + '\n\n';
+                    }
+                    return m;
+                });
+
+                // Handle dot-prefixed narrative blocks (e.g. ".An upper level trough..."):
+                // collapse internal multiple blank lines into a single newline so wrapped
+                // lines remain a single paragraph, and ensure the block is surrounded
+                // by exactly two newlines.
+                formatted = formatted.replace(/\n\n(\.[\s\S]{1,1000}?)\n\n/g, function(m, body) {
+                    const inner = String(body).replace(/\n{2,}/g, '\n').trim();
+                    return '\n\n' + inner + '\n\n';
+                });
+
+                // Safety: if any earlier replacement accidentally produced 3+ blank lines,
+                // collapse them to exactly two so we don't end up with quadruple spacing.
+                formatted = formatted.replace(/\n{3,}/g, '\n\n');
 
                 return formatted;
             }
@@ -1627,7 +1764,7 @@ Louisiana out 20 to 60 NM-`;
                     if (!b) return b;
                     // ensure '&&' and '$$' are on their own with double-newline separators
                     b = b.replace(/\s*&&\s*/g, '\n\n&&\n\n');
-                    b = b.replace(/\s*\$\$\s*/g, '\n\n$$\n\n');
+                    b = b.replace(/\s*\$\$\s*/g, '\n\n$$$$\n\n');
                     return b;
                 });
 
@@ -1677,7 +1814,21 @@ Louisiana out 20 to 60 NM-`;
                     return false;
                 }
 
-                function normalizeHeadlineCandidate(s) { return String(s || '').replace(/\s+/g, ' ').replace(/^BULLETIN - /i, '').trim(); }
+                function normalizeHeadlineCandidate(s) {
+                    return String(s || '')
+                        // Convert any literal escaped newlines ("\\n" / "\\r\\n") into spaces
+                        .replace(/\\r\\n|\\n/g, ' ')
+                        // Convert any real newlines into spaces as well
+                        .replace(/\r?\n+/g, ' ')
+                        // Collapse any remaining whitespace to a single space
+                        .replace(/\s+/g, ' ')
+                        .replace(/^BULLETIN - /i, '')
+                        // remove spaces/newlines immediately after leading ellipses ("... FLASH" -> "...FLASH")
+                        .replace(/(^\.+)\s+/, '$1')
+                        // remove spaces/newlines immediately before trailing ellipses ("FLASH ..." -> "FLASH...")
+                        .replace(/\s+(\.+$)/, '$1')
+                        .trim();
+                }
 
                 if (capNwsHeadline && capNwsHeadline.length) {
                     // sanitize internal newlines into spaces
@@ -2192,8 +2343,13 @@ Louisiana out 20 to 60 NM-`;
 
                 // --- START: build `alertinfo` object from message sections (WHAT / WHEN /WHERE / IMPACTS / threat fields) ---
                 (function() {
-                    const srcText = (msgPart || alertObj.message || '');
-                    const lines = String(srcText).split(/\r?\n/);
+                    // trim any preamble/headers before the first "HEADING..." line to avoid
+                    // including the CAP preamble/product header in alertinfo fields
+                    let srcText = (msgPart || alertObj.message || '');
+                    srcText = String(srcText);
+                    srcText = srcText.replace(/^[\s\S]*?(?=\n[A-Z0-9][A-Z0-9 \-\/&']{0,60}?\.{2,})/, '');
+
+                    const lines = srcText.split(/\r?\n/);
                     const secs = {}; // map of SECTION_NAME -> text
                     let cur = null;
 
@@ -2203,13 +2359,22 @@ Louisiana out 20 to 60 NM-`;
                         const line = rawLine.trim();
                         if (!line) continue;
                         const stripped = line.replace(/^[\s\*\-\u2022\u25BA\u25CF]+/, '').trim();
-                        // match headings that use two-or-more dots after a word (robust to 2 or more dots)
-                        const h = stripped.match(/^([A-Z0-9][A-Z0-9 \-\/&']{0,60}?)\.{2,}\s*(.*)$/i);
-                        if (h) {
-                            cur = h[1].toUpperCase();
-                            secs[cur] = (h[2] || '').trim();
+
+                        // split on each heading token so a single line can contain multiple sections
+                        // Accept headings that end with two-or-more dots, a colon, or short dashes
+                        // so forms like "WHAT...", "WHAT:", or "WHAT -" are all detected.
+                        const tokens = stripped.split(/([A-Z0-9][A-Z0-9 \-\/&']{0,60}?)\s*(?:\.{2,}|:|-{1,3})/i);
+                        if (tokens.length > 1) {
+                            for (let i = 1; i + 1 < tokens.length; i += 2) {
+                                const heading = tokens[i].toUpperCase();
+                                const content = (tokens[i + 1] || '').trim();
+                                if (content) {
+                                    secs[heading] = secs[heading] ? (secs[heading] + ' ' + content) : content;
+                                }
+                                cur = heading; // set current section for possible continuations
+                            }
                         } else if (cur) {
-                            // continuation line for current section (use stripped line so leading bullets don't pollute content)
+                            // continuation line for current section
                             secs[cur] = ((secs[cur] || '') + ' ' + stripped).trim();
                         }
                     }
