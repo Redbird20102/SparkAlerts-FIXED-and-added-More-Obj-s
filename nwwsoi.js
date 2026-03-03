@@ -59,6 +59,34 @@ function filterAlertsOnStartup() {
         filteredAlerts.push(...Object.values(etnMap).map(obj => obj.alert));
         fs.writeFileSync('alerts.json', JSON.stringify(filteredAlerts, null, 2));
         console.log('Startup alert filter applied.');
+                // Extract all segments between ellipses ("..."), allow newlines and multiple occurrences.
+                // Returns a single cleaned string (joined with " | ") for backward compatibility.
+                function extractHeadlineBetweenEllipses(s) {
+                    if (!s) return '';
+                    // Use a regex that matches '...' then lazily captures anything (including newlines)
+                    // up to the next '...'. The global flag finds multiple occurrences.
+                    const re = /\.\.\.([\s\S]*?)\.\.\./g;
+                    const matches = [];
+                    let m;
+                    while ((m = re.exec(s)) !== null) {
+                        if (m[1]) {
+                            // Fix cases where a newline splits a word (e.g. "includ\ning") by
+                            // removing newlines that occur directly between letters.
+                            let segment = m[1];
+                            // Join letters separated by one or more newlines (and optional spaces)
+                            segment = segment.replace(/([A-Za-z])\s*[\r\n]+\s*([A-Za-z])/g, '$1$2');
+                            // Normalize remaining whitespace (newlines -> space, collapse multiple spaces)
+                            const cleaned = segment.replace(/\s+/g, ' ').trim();
+                            if (cleaned) matches.push(cleaned);
+                        }
+                    }
+                    if (matches.length === 0) {
+                        // Fallback: no paired ellipses found — collapse newlines and return trimmed string
+                        return s.replace(/\s+/g, ' ').trim();
+                    }
+                    // Join multiple captured segments with a separator to keep them readable
+                    return matches.join(' | ');
+                }
     } catch (err) {
         console.error('Error during startup alert filter:', err);
     }
@@ -69,8 +97,6 @@ filterAlertsOnStartup();
 // Helper: build alert name from phenomena and significance codes
 function buildAlertNameFromVtec(phenomCode, significanceCode) {
     if (!phenomCode || !significanceCode) return null;
-    // Special-case: Red Flag Warning uses phenomenon FW with significance W
-    if (phenomCode === 'FW' && significanceCode === 'W') return 'Red Flag Warning';
     
     // Look up phenomenon name from phenomena.json
     const phenomEntry = phenomena[phenomCode];
@@ -86,28 +112,6 @@ function buildAlertNameFromVtec(phenomCode, significanceCode) {
     
     const label = significanceMap[significanceCode] || significanceCode;
     return `${phenomEntry.name} ${label}`;
-}
-
-            // formatMessageNewlines is hoisted to top-level (see earlier in file)
-
-// If invoked directly with --test-format, run a small test and exit.
-if (require.main === module && process.argv.includes('--test-format')) {
-    const samples = [
-        '...FLASH FLOOD WARNING REMAINS IN EFFECT UNTIL 1245 PM HST THIS AFTERNOON FOR THE ISLAND OF OAHU IN HONOLULU COUNTY...',
-        '...FLASH FLOOD WARNING REMAINS IN EFFECT UNTIL 1245 PM HST THIS AFTERNOON FOR THE ISLAND OF OAHU IN HONOLULU COUNTY...\nMore text',
-        'PREAMBLE ...FLASH FLOOD WARNING REMAINS...',
-        'PREAMBLE...FLASH FLOOD WARNING REMAINS...',
-        '... FLASH FLOOD WARNING REMAINS...',
-        'Some text...FLASH FLOOD WARNING...'
-    ];
-    for (const s of samples) {
-        console.log('--- ORIGINAL ---');
-        console.log(s);
-        console.log('--- FORMATTED ---');
-        console.log(formatMessageNewlines(s));
-        console.log('\n');
-    }
-    process.exit(0);
 }
 
 (async () => {
@@ -131,6 +135,8 @@ if (require.main === module && process.argv.includes('--test-format')) {
                 if (!Array.isArray(alerts)) alerts = [];
             } catch (readErr) {
                 if (readErr.code !== 'ENOENT') {
+            // Final clean headline: extract between ellipses, remove newlines
+            headline = extractHeadlineBetweenEllipses(headline);
                     console.warn('alerts.json unreadable during cleanup:', readErr.message);
                     log('alerts.json unreadable during cleanup: ' + readErr.message);
                 }
@@ -209,6 +215,28 @@ if (require.main === module && process.argv.includes('--test-format')) {
         xmpp.on('close', () => {
             log('XMPP connection closed. Reconnecting...');
             handleReconnect();
+        });
+
+        // Handle stream/client errors to avoid unhandled exceptions crashing the process.
+        xmpp.on('error', (err) => {
+            try {
+                const msg = (err && err.message) ? err.message : String(err);
+                log('XMPP error: ' + msg);
+                console.error('XMPP error:', err);
+
+                // If the error is a stream 'conflict', it's typically a resource/jid conflict
+                // (another client connected with the same JID). Attempt a reconnect with backoff.
+                if (err && err.condition === 'conflict') {
+                    log('XMPP stream conflict detected; will attempt reconnect.');
+                    handleReconnect();
+                    return;
+                }
+
+                // For other errors, attempt reconnect as well but do not throw.
+                handleReconnect();
+            } catch (e) {
+                console.error('Error handling XMPP error event:', e);
+            }
         });
 
         return xmpp;
@@ -384,6 +412,47 @@ try {
                 return new Date(utcMillis).toISOString();
             }
 
+            // Helper: parse 6-digit WMO/WMO-like header timestamps (DDHHMM) into ISO UTC strings.
+            // Examples seen in preambles: "WUUS54 KMEG 270104" -> 27th day at 01:04 UTC
+            function sixDigitHeaderToIso(s) {
+                if (!s || !/^[0-9]{6}$/.test(s)) return null;
+                try {
+                    const now = new Date();
+                    const day = parseInt(s.slice(0, 2), 10);
+                    const hour = parseInt(s.slice(2, 4), 10);
+                    const minute = parseInt(s.slice(4, 6), 10);
+
+                    // Build candidate on current UTC month/year
+                    let cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), day, hour, minute));
+
+                    // If candidate is >16 days away from now, assume month roll-over and adjust by +/-1 month
+                    const diff = cand.getTime() - now.getTime();
+                    const sixteenDays = 16 * 24 * 60 * 60 * 1000;
+                    if (Math.abs(diff) > sixteenDays) {
+                        if (diff > 0) {
+                            // candidate too far in future -> likely previous month
+                            cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, day, hour, minute));
+                        } else {
+                            // candidate too far in past -> likely next month
+                            cand = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, day, hour, minute));
+                        }
+                    }
+                    return new Date(cand.getTime()).toISOString();
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            // Extract any 6-digit tokens often embedded in WMO/AWIPS headers or UGC timestamps.
+            // Prefer the first as the issuing timestamp and the second as the expiry timestamp when present.
+            let headerStartIso = null;
+            let headerEndIso = null;
+            try {
+                const sixMatches = (String(rawText || '').match(/\b(\d{6})\b/g) || []).map(s => String(s));
+                if (sixMatches.length >= 1) headerStartIso = sixDigitHeaderToIso(sixMatches[0]);
+                if (sixMatches.length >= 2) headerEndIso = sixDigitHeaderToIso(sixMatches[1]);
+            } catch (e) { /* ignore */ }
+
 
             // ===================== FULL MESSAGE FORMAT DETECTION ===========================
             // If the message contains any of the keywords, skip CAP XML cleanup.
@@ -543,13 +612,6 @@ Louisiana out 20 to 60 NM-`;
                         // Prepend any original preamble (e.g., 194\n\nXOUS54 KWBC 311944\n\nCAPLIX\n\n)
                         const preambleMatch = rawText.match(/^[\s\S]*?(?=<\?xml)/);
                         let finalMsg = (preambleMatch ? preambleMatch[0] : '') + cleanedMsg;
-                      
-                        // If the preamble contains a WMO/CAP header like
-                        //   "316 XOUS53 KWBC 222002 CAPJKL"
-                        // normalize it into separate lines for the minimal cleanup path so the
-                        // resulting object message preserves the preamble layout.
-                        // Result: "316\nXOUS53 KWBC 222002\nCAPJKL\n\n"
-                        finalMsg = finalMsg.replace(/^\s*(\d{1,4})\s+([A-Z0-9]{3,8})\s+([A-Z0-9]{3,8})\s+(\d{3,6})\s+(CAP[A-Z0-9-]*)\s*/m, '$1\n$2 $3 $4\n$5\n\n');
 
                         // Normalize paragraphs (preserve paragraph breaks; join wrapped lines)
                         finalMsg = normalizeParagraphs(finalMsg);
@@ -562,9 +624,8 @@ Louisiana out 20 to 60 NM-`;
                             if (/\/O\..*?\/\n?/.test(rawText) || /<parameter>\s*<valueName>VTEC<\/valueName>/i.test(rawText)) finalMsg = finalMsg.replace(re, '').trim();
                         }
 
-                        // Replace message in parsedAlert/message and mark minimal CAP cleanup
+                        // Replace message in parsedAlert/message
                         rawText = finalMsg;
-                        capMinimalCleanup = true;
                     });
                     // Normalize the full rawText after CAP cleanup to convert escape sequences and clean structure
                     rawText = formatMessageNewlines(rawText);
@@ -606,8 +667,8 @@ Louisiana out 20 to 60 NM-`;
                     phenomena: vtecObjects[3],
                     significance: vtecObjects[4],
                     eventTrackingNumber: vtecObjects[5],
-                    startTime: (parseHumanTimestampFromText(rawText) || vtecToIso(vtecObjects[6].split('-')[0])),
-                    endTime: vtecToIso(vtecObjects[6].split('-')[1])
+                    startTime: (headerStartIso || parseHumanTimestampFromText(rawText) || vtecToIso(vtecObjects[6].split('-')[0])),
+                    endTime: (headerEndIso || vtecToIso(vtecObjects[6].split('-')[1]))
                 }
             } catch (err) {
                 // No VTEC, allow fallback to event-based logic
@@ -717,22 +778,8 @@ Louisiana out 20 to 60 NM-`;
                                 const headerRegex = /^(\d{3})\s+([A-Z]{6})\s+([A-Z]{4} \d{6} [A-Z]{6})/;
                                 const headerMatch = preamble.match(headerRegex);
                                 if (headerMatch) {
-                                    // Split header into parts. If the 3rd capture contains an extra
-                                    // trailing product token (e.g. "KWBC 221334 CAPBGM"), move
-                                    // that trailing token to its own line so the header becomes:
-                                    // 514
-                                    // XOUS51 KWBC 221334
-                                    // CAPBGM
-                                    let headerParts;
-                                    const third = (headerMatch[3] || '').trim();
-                                    const thirdParts = third.split(/\s+/).filter(Boolean);
-                                    if (thirdParts.length > 2) {
-                                        const tail = thirdParts.pop();
-                                        const rest = thirdParts.join(' ');
-                                        headerParts = [headerMatch[1], headerMatch[2] + (rest ? ' ' + rest : ''), tail];
-                                    } else {
-                                        headerParts = [headerMatch[1], headerMatch[2], headerMatch[3]];
-                                    }
+                                    // Split header into parts
+                                    const headerParts = [headerMatch[1], headerMatch[2], headerMatch[3]];
                                     // Remove header from preamble
                                     preamble = preamble.replace(headerRegex, '').trim();
                                     // If there is any remaining preamble, split by double newlines
@@ -816,7 +863,7 @@ Louisiana out 20 to 60 NM-`;
 
                                 let result = out.join('-');
                                 if (timestampSuffix && !result.endsWith('-')) result += '-';
-                                if (timestampSuffix) result += timestampSuffix;
+                                if (timestampSuffix) result += timestampSuffix + '\n';
                                 // Ensure trailing hyphen
                                 if (!result.endsWith('-')) result += '-';
                                 return result;
@@ -851,12 +898,7 @@ Louisiana out 20 to 60 NM-`;
                             // Clean areaDesc: replace semicolons/commas/newlines with hyphens and ensure trailing '-'
                             let areaDesc = extractText(info.area && info.area.areaDesc);
                             if (areaDesc) {
-                                // Replace semicolons/commas/newlines with hyphens and remove
-                                // any spaces around hyphens so we keep compact tokens like
-                                // "Sullivan-Bradford-Susquehanna-..."
                                 areaDesc = areaDesc.replace(/[;,]/g, '-').replace(/\s*\n\s*/g, '-').replace(/\s+/g, ' ').trim();
-                                // remove spaces around hyphens
-                                areaDesc = areaDesc.replace(/\s*-\s*/g, '-');
                                 areaDesc = areaDesc.replace(/-+/g, '-').replace(/^[-\s]+|[-\s]+$/g, '');
                                 if (areaDesc.length) areaDesc = areaDesc + '-';
                             }
@@ -956,24 +998,9 @@ Louisiana out 20 to 60 NM-`;
                             if (event) minimalParts.push(formatMessageNewlines(event));
                             if (sender) minimalParts.push(formatMessageNewlines(sender));
                             if (sent) minimalParts.push(formatMessageNewlines(formatIssuedTime(sent)));
-                            if (ugcLine) {
-                                const fu = formatMessageNewlines(ugcLine);
-                                // preserve an extra newline after the UGC code line so the following
-                                // content starts on the next line
-                                minimalParts.push(fu + '\n');
-                            }
+                            if (ugcLine) minimalParts.push(formatMessageNewlines(ugcLine));
                             if (areaDesc) minimalParts.push(formatMessageNewlines(areaDesc));
-                            if (capNwsHeadline) {
-                                // Ensure headline is surrounded by exactly two newlines for non-VTEC CAP
-                                // cleanup, but do not double-wrap if it's already wrapped with two newlines.
-                                let fh = formatMessageNewlines(capNwsHeadline || '');
-                                const hasTwo = fh.startsWith('\n\n') && fh.endsWith('\n\n');
-                                if (!hasTwo) {
-                                    // strip existing leading/trailing newlines then wrap
-                                    fh = '\n\n' + fh.replace(/^\n+|\n+$/g, '') + '\n\n';
-                                }
-                                minimalParts.push(fh);
-                            }
+                            if (capNwsHeadline) minimalParts.push(formatMessageNewlines(capNwsHeadline));
                             if (description) minimalParts.push(formatMessageNewlines(description));
                             if (instruction) minimalParts.push(formatMessageNewlines(instruction));
 
@@ -1147,7 +1174,7 @@ Louisiana out 20 to 60 NM-`;
                                 if (coords.length) parts.push(...coords);
                                 const cleaned = parts.join(' ');
                                 if (cleaned.length) {
-                                    minimalParts.push('TIME...MOT...LOC ' + cleaned);
+                                    minimalParts.push('TIME...MOT...LOC ' + cleaned + '\n\n');
                                 }
                                 // Insert waterspout, hail, wind lines in order if present
                                 if (waterspoutLine) minimalParts.push(waterspoutLine);
@@ -1161,9 +1188,6 @@ Louisiana out 20 to 60 NM-`;
                             if (minimalParts.length) {
                                 // join parts with double-newlines so that normalizeParagraphs treats them as separate
                                 rawText = minimalParts.join('\n\n') + '\n';
-                                // mark that we performed a non-VTEC minimal CAP cleanup so callers
-                                // later will NOT split the message into multiple parts
-                                capMinimalCleanup = true;
                                 // normalize newlines (convert escaped sequences and clean structure) first
                                 rawText = formatMessageNewlines(rawText);
                                 // then normalize paragraphs (preserve paragraph breaks; join wrapped lines)
@@ -1181,11 +1205,35 @@ Louisiana out 20 to 60 NM-`;
             }
             
             // If no VTEC and not allowed by event, skip
+            // If no VTEC and not allowed by event, check allowedalerts.json
             if (
                 (!thisObject.phenomena || !thisObject.significance) &&
                 !allowByEvent
             ) {
-                return;
+                // Try to extract event name from rawText
+                let eventName = null;
+                let eventMatch = rawText && rawText.match(/<event>(.*?)<\/event>/i);
+                if (eventMatch) {
+                    eventName = eventMatch[1].trim();
+                } else {
+                    // Fallback: try to match allowed alert names in text
+                    if (Array.isArray(allowedAlerts)) {
+                        const txt = String(rawText || '').toUpperCase();
+                        const matches = allowedAlerts.filter(a => {
+                            const au = String(a || '').toUpperCase();
+                            return au && txt.includes(au);
+                        });
+                        if (matches.length) {
+                            eventName = matches[0];
+                        }
+                    }
+                }
+                // If eventName is allowed, let it through
+                if (eventName && Array.isArray(allowedAlerts) && allowedAlerts.some(a => String(a).toUpperCase() === String(eventName).toUpperCase())) {
+                    // Let it through
+                } else {
+                    return;
+                }
             }
 
             if (thisObject.actions === 'CAN' || thisObject.actions === 'EXP') {
@@ -1581,12 +1629,6 @@ Louisiana out 20 to 60 NM-`;
                 // 2) Normalize any remaining CR/LF into \n
                 formatted = formatted.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-                // If an uppercase headline is split across newlines inside leading/trailing ellipses,
-                // normalize it to a single headline paragraph. Examples handled:
-                //   "...\nFLASH FLOOD WARNING..."  -> "\n\n...FLASH FLOOD WARNING...\n\n"
-                //   "... FLASH\n..."                 -> "\n\n...FLASH...\n\n"
-                formatted = formatted.replace(/(\.{3,})\s*([A-Z0-9][A-Z0-9 \-\/,()'\.&]{1,200}?)\s*(\.{3,})/g, '\n\n$1$2$3\n\n');
-
                 // 3) Remove stray trailing/leading whitespace around newlines (prevents " <newline>HEADING" cases)
                 formatted = formatted.replace(/[ \t]+\n/g, '\n');
                 formatted = formatted.replace(/\n[ \t]+/g, '\n');
@@ -1603,16 +1645,9 @@ Louisiana out 20 to 60 NM-`;
                 for (const h of twoNL) {
                     // If the heading is on the same line as previous text (possibly separated by spaces),
                     // strip those spaces and insert exactly two newlines before the heading.
-                    // BUT: if the heading is immediately preceded by an ellipsis ("..."), do NOT insert
-                    // any newlines (preserve the '...HEADING' form).
-                    formatted = formatted.replace(new RegExp('((?:\\.{3,})|[^\\n\\s])\\s*(' + h + ')', 'g'), (m, p1, p2) => {
-                        if (/^\.{3,}/.test(p1)) return p1 + p2;
-                        return p1 + '\\n\\n' + p2;
-                    });
+                    formatted = formatted.replace(new RegExp('([^\\n\\s])\\s*(' + h + ')', 'g'), '$1\n\n$2');
                     // Collapse any existing newline(s)+optional spaces before the heading to exactly two newlines
-                    // (if the heading is already preceded by an ellipsis and a newline, leave as-is to avoid
-                    // inserting extra blank lines inside ellipses-containing constructs).
-                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\\n\\n$1');
+                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\n\n$1');
                 }
 
                 // 7) Ensure exact spacing before headings that should have ONE newline
@@ -1637,13 +1672,9 @@ Louisiana out 20 to 60 NM-`;
                 ];
                 for (const h of oneNL) {
                     // If heading immediately follows text (possibly with spaces), strip spaces and insert one newline
-                    // BUT: preserve '...HEADING' where an ellipsis directly precedes the heading.
-                    formatted = formatted.replace(new RegExp('((?:\\.{3,})|[^\\n\\s])\\s*(' + h + ')', 'g'), (m, p1, p2) => {
-                        if (/^\.{3,}/.test(p1)) return p1 + p2;
-                        return p1 + '\\n' + p2;
-                    });
+                    formatted = formatted.replace(new RegExp('([^\\n\\s])\\s*(' + h + ')', 'g'), '$1\n$2');
                     // Collapse any existing newline(s)+optional spaces before the heading to exactly one newline
-                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\\n$1');
+                    formatted = formatted.replace(new RegExp('\\n+\\s*(' + h + ')', 'g'), '\n$1');
                 }
 
                 // 8) Ensure TIME...MOT...LOC is single-lined (followed by normal spacing)
@@ -1653,31 +1684,6 @@ Louisiana out 20 to 60 NM-`;
                 formatted = formatted.replace(/[ \t]+\n/g, '\n');
                 formatted = formatted.replace(/\n{2,}/g, '\n\n');
                 formatted = formatted.replace(/^\s+|\s+$/g, '');
-
-                // FINAL: ensure any uppercase headline enclosed in leading+trailing ellipses
-                // does not contain internal newlines and is surrounded by blank lines.
-                // Example: "...THIS\nEVENING..." -> "\n\n...THIS EVENING...\n\n"
-                formatted = formatted.replace(/(\.{3,})\s*([\s\S]{1,300}?)\s*(\.{3,})/g, (m, lead, inner, trail) => {
-                    const collapsed = String(inner).replace(/\s*\n+\s*/g, ' ').trim();
-                    // Only transform when the interior looks like an uppercase headline (allow numbers/punct)
-                    if (/^[A-Z0-9 \-\/(),.'&]{1,300}$/.test(collapsed)) {
-                        return '\n\n' + lead + collapsed + trail + '\n\n';
-                    }
-                    return m;
-                });
-
-                // Handle dot-prefixed narrative blocks (e.g. ".An upper level trough..."):
-                // collapse internal multiple blank lines into a single newline so wrapped
-                // lines remain a single paragraph, and ensure the block is surrounded
-                // by exactly two newlines.
-                formatted = formatted.replace(/\n\n(\.[\s\S]{1,1000}?)\n\n/g, function(m, body) {
-                    const inner = String(body).replace(/\n{2,}/g, '\n').trim();
-                    return '\n\n' + inner + '\n\n';
-                });
-
-                // Safety: if any earlier replacement accidentally produced 3+ blank lines,
-                // collapse them to exactly two so we don't end up with quadruple spacing.
-                formatted = formatted.replace(/\n{3,}/g, '\n\n');
 
                 return formatted;
             }
@@ -1731,31 +1737,59 @@ Louisiana out 20 to 60 NM-`;
 
                 let blocks = [];
                 for (let part of parts) {
-                    // Find all UGC code positions
+                    // Find all UGC code positions (record start and end)
                     let indices = [];
                     let match;
+                    ugcPattern.lastIndex = 0;
                     while ((match = ugcPattern.exec(part)) !== null) {
-                        indices.push({ index: match.index, code: match[1] });
+                        const start = match.index;
+                        const code = match[1];
+                        const end = start + code.length;
+                        indices.push({ start, end, code });
                     }
 
+                    // If no UGC codes, keep the whole part
                     if (indices.length === 0) {
                         blocks.push(part);
-                    } else {
-                        for (let i = 0; i < indices.length; i++) {
-                          const start = indices[i].index;
-                          const end = (i + 1 < indices.length) ? indices[i + 1].index : part.length;
-                          let block = part.slice(start, end);
+                        continue;
+                    }
 
-                          // Optionally, prepend any preamble before the first UGC code to the first block
-                          if (i === 0 && start > 0) {
-                            let preamble = part.slice(0, start);
-                            if (preamble) block = preamble + block;
-                          }
-
-                          // Normalize paragraphs inside the block (preserve paragraph breaks; join wrapped lines)
-                          block = normalizeParagraphs(block);
-                          blocks.push(block);
+                    // Group nearby UGC matches into clusters so adjacent UGC groups
+                    // (e.g., "FLZ...-  GAZ...-") remain together and are not split.
+                    const clusters = [];
+                    let cur = { start: indices[0].start, end: indices[0].end };
+                    for (let i = 1; i < indices.length; i++) {
+                        const gapText = part.slice(cur.end, indices[i].start);
+                        // If the gap between codes does NOT contain a paragraph break (\n\n)
+                        // or explicit message delimiters (&&, $$), treat the codes as part
+                        // of the same UGC cluster. This keeps multiple different UGC prefixes
+                        // on the same block as long as they're in the same paragraph.
+                        if (!(/\n{2,}/.test(gapText) || /&&|\$\$/.test(gapText))) {
+                            // extend current cluster to include this code
+                            cur.end = indices[i].end;
+                        } else {
+                            // close current cluster and start new
+                            clusters.push({ start: cur.start, end: cur.end });
+                            cur = { start: indices[i].start, end: indices[i].end };
                         }
+                    }
+                    clusters.push({ start: cur.start, end: cur.end });
+
+                    // For each cluster, capture the text from cluster.start to the next cluster.start (or to end)
+                    for (let ci = 0; ci < clusters.length; ci++) {
+                        const c = clusters[ci];
+                        const nextStart = (ci + 1 < clusters.length) ? clusters[ci + 1].start : part.length;
+                        let block = part.slice(c.start, nextStart);
+
+                        // Optionally, prepend any preamble before the first cluster to the first block
+                        if (ci === 0 && c.start > 0) {
+                            let preamble = part.slice(0, c.start);
+                            if (preamble) block = preamble + block;
+                        }
+
+                        // Normalize paragraphs inside the block (preserve paragraph breaks; join wrapped lines)
+                        block = normalizeParagraphs(block);
+                        blocks.push(block);
                     }
                 }
 
@@ -1809,18 +1843,13 @@ Louisiana out 20 to 60 NM-`;
                     if (!/^[A-Z0-9 \-\.\'\,]+$/.test(t)) return false; // expect uppercase/punctuation
                     // If first line ends with a short connector word or the second line is very short,
                     // treat as continuation (covers "THIS\n\nEVENING").
-                    if (/\b(THIS|UNTIL|TONIGHT|EVENING|MORNING|AFTERNOON|TODAY)\b$/i.test(firstLine)) return true;
+                    if (/\b(THIS|UNTIL|TONIGHT|EVENING|MORNING|AFTERNOON|TODAY|COUNTY|COUNTIES|EFFECT)\b$/i.test(firstLine)) return true;
                     if (t.split(/\s+/).length <= 3) return true;
                     return false;
                 }
 
                 function normalizeHeadlineCandidate(s) {
                     return String(s || '')
-                        // Convert any literal escaped newlines ("\\n" / "\\r\\n") into spaces
-                        .replace(/\\r\\n|\\n/g, ' ')
-                        // Convert any real newlines into spaces as well
-                        .replace(/\r?\n+/g, ' ')
-                        // Collapse any remaining whitespace to a single space
                         .replace(/\s+/g, ' ')
                         .replace(/^BULLETIN - /i, '')
                         // remove spaces/newlines immediately after leading ellipses ("... FLASH" -> "...FLASH")
@@ -1879,6 +1908,19 @@ Louisiana out 20 to 60 NM-`;
                 }
             } catch {}
 
+            // If the raw message contains ellipses ("..."), prefer the text
+            // between the first matched ellipsis pair as the headline. This
+            // captures across newlines so a headline split like
+            // "...UNTIL 11 AM AKST\nTUESDAY..." becomes a single headline.
+            try {
+                if (/\.\.\./.test(rawText)) {
+                    const extracted = extractHeadlineBetweenEllipses(rawText);
+                    if (extracted && extracted.length) {
+                        headline = normalizeHeadlineCandidate(extracted);
+                    }
+                }
+            } catch (e) { /* ignore */ }
+
             // Build parsedAlert objects for each message part
             // Helper: expand a UGC group string into individual UGC IDs (ignore timestamps / non-3-digit tokens)
             function expandUgcGroup(group) {
@@ -1893,8 +1935,11 @@ Louisiana out 20 to 60 NM-`;
                 const out = new Set();
 
                 for (const p of parts) {
-                    // ignore 6-digit timestamps like 141800
-                    if (/^\d{6}$/.test(p)) continue;
+                    // handle 6-digit timestamps like 282200 by adding newline after
+                    if (/^\d{6}$/.test(p)) {
+                        out.add(p + '\n');
+                        continue;
+                    }
                     // single 3-digit
                     let r;
                     if ((r = p.match(/^\s*(\d{3})\s*$/))) {
@@ -2047,8 +2092,8 @@ Louisiana out 20 to 60 NM-`;
                         phenomena: vtecObjects[3],
                         significance: vtecObjects[4],
                         eventTrackingNumber: vtecObjects[5],
-                        startTime: (parseHumanTimestampFromText(msgPart) || vtecToIso(vtecObjects[6].split('-')[0])),
-                        endTime: vtecToIso(vtecObjects[6].split('-')[1])
+                        startTime: (headerStartIso || parseHumanTimestampFromText(msgPart) || vtecToIso(vtecObjects[6].split('-')[0])),
+                        endTime: (headerEndIso || vtecToIso(vtecObjects[6].split('-')[1]))
                     };
                 } else {
                     // fallback: if the main `thisObject` contains a genuine VTEC (has phenomena+significance), use it
@@ -2058,8 +2103,8 @@ Louisiana out 20 to 60 NM-`;
                         // non-VTEC: construct a minimal vtec object only if we have values to add
                         const minimal = {};
                         const etn = (thisObject && thisObject.eventTrackingNumber) || capIdentifier || null;
-                        const st = (thisObject && thisObject.startTime) || capSent || null;
-                        const en = (thisObject && thisObject.endTime) || capExpires || null;
+                        const st = (thisObject && thisObject.startTime) || capSent || headerStartIso || null;
+                        const en = (thisObject && thisObject.endTime) || capExpires || headerEndIso || null;
                         if (etn) minimal.eventTrackingNumber = etn;
                         if (st) minimal.startTime = st;
                         if (en) minimal.endTime = en;
@@ -2126,6 +2171,33 @@ Louisiana out 20 to 60 NM-`;
                             }
                         }
                     }
+                }
+
+                // If the message part contains text enclosed in '...' pairs, extract and
+                // normalize it and merge into the headline so `alertObj.headline` includes it.
+                function extractBetweenEllipsesFromText(s) {
+                    if (!s || typeof s !== 'string') return null;
+                    const re = /\.\.\.([\s\S]*?)\.\.\./g;
+                    const parts = [];
+                    let mm;
+                    while ((mm = re.exec(s)) !== null) {
+                        if (!mm[1]) continue;
+                        let seg = mm[1];
+                        // join letters split across newlines/spaces
+                        seg = seg.replace(/([A-Za-z])\s*[\r\n]+\s*([A-Za-z])/g, '$1$2');
+                        // collapse remaining whitespace
+                        seg = seg.replace(/\s+/g, ' ').trim();
+                        if (seg) parts.push(seg);
+                    }
+                    if (!parts.length) return null;
+                    return parts.join(' | ');
+                }
+
+                // prefer extraction from the specific message part, fallback to full rawText
+                const ellipsesExtract = extractBetweenEllipsesFromText(msgPart) || extractBetweenEllipsesFromText(rawText);
+                if (ellipsesExtract) {
+                    if (headline && headline.length) headline = (headline + ' | ' + ellipsesExtract).trim();
+                    else headline = ellipsesExtract;
                 }
 
                 let alertObj = {
@@ -2361,9 +2433,7 @@ Louisiana out 20 to 60 NM-`;
                         const stripped = line.replace(/^[\s\*\-\u2022\u25BA\u25CF]+/, '').trim();
 
                         // split on each heading token so a single line can contain multiple sections
-                        // Accept headings that end with two-or-more dots, a colon, or short dashes
-                        // so forms like "WHAT...", "WHAT:", or "WHAT -" are all detected.
-                        const tokens = stripped.split(/([A-Z0-9][A-Z0-9 \-\/&']{0,60}?)\s*(?:\.{2,}|:|-{1,3})/i);
+                        const tokens = stripped.split(/([A-Z0-9][A-Z0-9 \-\/&']{0,60}?)\.{2,}/i);
                         if (tokens.length > 1) {
                             for (let i = 1; i + 1 < tokens.length; i += 2) {
                                 const heading = tokens[i].toUpperCase();
@@ -2461,6 +2531,8 @@ Louisiana out 20 to 60 NM-`;
                     fallbackSet('HAIL_DAMAGE_THREAT', hailThreatRe, s => s.trim());
                     fallbackSet('WIND_THREAT', windThreatRe, s => s.trim());
                     fallbackSet('WIND_DAMAGE_THREAT', windThreatRe, s => s.trim());
+                    // Thunderstorm damage threat: similar fallback when explicit heading wasn't parsed
+                    fallbackSet('THUNDERSTORM_DAMAGE_THREAT', /THUNDERSTORM(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i, s => s.trim());
                     // NOTE: Do NOT add fallback for FLASH_FLOOD_DAMAGE_THREAT — only use explicit headings
 
                     // Also populate short-form FLASH_FLOOD if present as a heading or sentence
@@ -2551,6 +2623,47 @@ Louisiana out 20 to 60 NM-`;
                             return !(alert.id === alertId);
                         });
                     }
+                    // Filtering rules (per user request):
+                    // - If the alert name matches a phenomenon entry in phenomena.json AND there is no VTEC, skip it.
+                    // - If the alert has a VTEC, allow it regardless of name.
+                    // - If the alert has no VTEC but its name appears in allowedalerts.json, allow it.
+                    try {
+                        const name = String(parsedAlert.name || '').trim();
+                        // Consider a VTEC 'present' only when phenomena and significance are available
+                        const hasFullVtec = parsedAlert.properties && parsedAlert.properties.vtec && parsedAlert.properties.vtec.phenomena && parsedAlert.properties.vtec.significance;
+                        // Treat an alert as a phenomena match when the alert name contains
+                        // a phenomena.json `name` token as a whole word (e.g. "Tornado Warning"
+                        // should match phenomena name "Tornado"). Use word-boundary regex to
+                        // avoid accidental partial matches.
+                        function _escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\\]\\]/g, '\\$&'); }
+                        const nameInPhenomena = name && Object.values(phenomena).some(p => {
+                            if (!p || !p.name) return false;
+                            const ph = String(p.name).trim();
+                            if (!ph) return false;
+                            const re = new RegExp('\\b' + _escapeRe(ph) + '\\b', 'i');
+                            return re.test(name);
+                        });
+
+                        if (nameInPhenomena && !hasFullVtec) {
+                            console.log(`Skipping alert (phenomena match, no VTEC): ${name}`);
+                            log('Skipping alert (phenomena match, no VTEC): ' + name);
+                            return; // skip adding this parsedAlert
+                        }
+
+                        if (!hasFullVtec) {
+                            // No VTEC: allow only if explicitly listed in allowedalerts.json
+                            const allowed = Array.isArray(allowedAlerts) && allowedAlerts.some(a => String(a || '').toUpperCase() === name.toUpperCase());
+                            if (!allowed) {
+                                console.log(`Skipping alert (no VTEC and not allowed): ${name}`);
+                                log('Skipping alert (no VTEC and not allowed): ' + name);
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        // If filtering check fails for any reason, default to storing the alert to avoid data loss
+                        console.warn('Alert filtering error, defaulting to store:', e && e.message);
+                    }
+
                     alerts.push(parsedAlert);
                     console.log(`✓ Alert stored successfully: ${parsedAlert.name} (ID: ${parsedAlert.id})`);
                     log('Alert stored successfully: ' + parsedAlert.name + ' (ID: ' + parsedAlert.id + ')');
