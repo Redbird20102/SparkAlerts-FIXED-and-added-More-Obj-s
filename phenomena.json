@@ -27,6 +27,10 @@
     "name": "Coastal Flood",
     "significance": ["W", "A", "Y", "S"]
   },
+  "CW": {
+    "name": "Cold Weather",
+    "significance": ["W", "A", "Y", "S"]
+  },
   "DS": {
     "name": "Dust Storm",
     "significance": ["W", "A", "Y", "S"]
@@ -48,7 +52,7 @@
     "significance": ["W", "A", "Y", "S"]
   },
   "FA": {
-    "name": "Areal Flood",
+    "name": "Flood",
     "significance": ["W", "A", "Y", "S"]
   },
   "FF": {
@@ -69,7 +73,7 @@
   },
   "FW": {
     "name": "Fire Weather",
-    "significance": ["A", "Y", "S"]
+    "significance": ["W", "A", "Y", "S"]
   },
   "FZ": {
     "name": "Freeze",
@@ -224,7 +228,7 @@
     "significance": ["W", "A", "Y", "S"]
   },
   "UP": {
-    "name": "Heavy Freezing Spray",
+    "name": "Freezing Spray",
     "significance": ["W", "A", "Y", "S"]
   },
   "WC": {
