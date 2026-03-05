@@ -1294,9 +1294,6 @@ Louisiana out 20 to 60 NM-`;
                 } else {
                     return;
                 }
-            }
-
-            if (thisObject.action === 'CAN' || thisObject.action === 'EXP') {
                 // This is a cancellation or expiration, delete the alert from the database
                 try {
                     let alerts = [];
@@ -2293,19 +2290,44 @@ Louisiana out 20 to 60 NM-`;
                     if (pairs.length) canonicalUgc = pairs[0] + '-';
                 }
 
-                if (canonicalUgc) {
-                    const ugcIds = expandUgcGroup(canonicalUgc);
-                    // store as array of individual UGC codes as requested
-                    alertObj.ugc = ugcIds;
+                // Collect all candidate UGC IDs from canonical group (expanded) AND any standalone tokens
+                const candidateSet = new Set();
+                try {
+                    if (canonicalUgc) {
+                        const ugcIds = expandUgcGroup(canonicalUgc).filter(Boolean);
+                        for (const id of ugcIds) candidateSet.add(id);
+                    }
 
-                    if (ugcIds.length) {
-                        // fetch all display names in parallel (cached)
-                        const results = await Promise.all(ugcIds.map(id => lookupZoneDisplay(id)));
-                        const names = results.filter(Boolean);
+                    const pairReAll = /([A-Z]{2,3})(\d{3})/g;
+                    let mmx;
+                    const sourcesToScan = [msgPart, rawText];
+                    for (const src of sourcesToScan) {
+                        if (!src) continue;
+                        const scanStr = String(src)
+                            .replace(/\\u300C/g, '-')
+                            .replace(/\u300C/g, '-');
+                        while ((mmx = pairReAll.exec(scanStr)) !== null) {
+                            candidateSet.add(mmx[1] + mmx[2]);
+                        }
+                    }
+                } catch (e) {
+                    // ignore collection errors
+                }
+
+                // Keep only well-formed zone IDs like 'ABC123'
+                const candidateIds = Array.from(candidateSet).filter(x => /^[A-Z]{2,3}\d{3}$/.test(x));
+                if (candidateIds.length) {
+                    alertObj.ugc = candidateIds;
+
+                    // Resolve display names for all candidate IDs (counties, forecast zones, etc.)
+                    try {
+                        const results = await Promise.all(candidateIds.map(id => lookupZoneDisplay(id)));
+                        const names = results.map((n, i) => n ? n : null).filter(Boolean);
                         if (names.length) {
-                            // Join multiple names with semicolon as requested
                             alertObj.areaDesc = names.join('; ');
                         }
+                    } catch (e) {
+                        // if lookups fail, leave areaDesc empty for later fallback
                     }
                 }
 
@@ -2412,14 +2434,14 @@ Louisiana out 20 to 60 NM-`;
                         if (alertObj && alertObj.description && typeof alertObj.description === 'string' && raw) {
                             const esc = raw.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
                             try {
-                                alertObj.description = alertObj.description.replace(new RegExp(esc + '(?:\\s*)'), raw + '\\n\\n');
+                                alertObj.description = alertObj.description.replace(new RegExp(esc + '(?:\\s*)'), raw + '\n\n');
                             } catch (e) {
                                 // If regex construction fails for any reason, fall back to simple replace
-                                alertObj.description = alertObj.description.replace(raw, raw + '\\n\\n');
+                                alertObj.description = alertObj.description.replace(raw, raw + '\n\n');
                             }
 
                             // Normalize any occurrence of FLASH FLOOD to have two leading newlines
-                            alertObj.description = alertObj.description.replace(/\n*\s*FLASH\s+FLOOD/gi, '\\n\\nFLASH FLOOD');
+                            alertObj.description = alertObj.description.replace(/\n*\s*FLASH\s+FLOOD/gi, '\n\nFLASH FLOOD');
                         }
 
                         // If the eventMotionDescription includes a valid lat/lon and no coordinates were already
@@ -2653,7 +2675,7 @@ Louisiana out 20 to 60 NM-`;
                         return (m && m[1]) ? m[1].trim() : up.trim();
                     }
 
-                    const _threatKeys = ['HAIL_THREAT','WIND_THREAT','TORNADO_DAMAGE_THREAT','FLASH_FLOOD_DAMAGE_THREAT','THUNDERSTORM_DAMAGE_THREAT','FLASH_FLOOD'];
+                    const _threatKeys = ['HAIL_THREAT','WIND_THREAT','TORNADO','TORNADO_DAMAGE_THREAT','FLASH_FLOOD_DAMAGE_THREAT','THUNDERSTORM_DAMAGE_THREAT','FLASH_FLOOD'];
                     for (const tk of _threatKeys) {
                         if (Object.prototype.hasOwnProperty.call(ai, tk) && ai[tk]) ai[tk] = simplifyThreatValue(ai[tk]);
                     }
@@ -2712,6 +2734,16 @@ Louisiana out 20 to 60 NM-`;
                     // - If the alert has no VTEC but its name appears in allowedalerts.json, allow it.
                     try {
                         const name = String((parsedAlert.event || parsedAlert.name) || '').trim();
+                        // Skip alerts that are Area Forecast Discussions embedded in the description
+                        try {
+                            if (parsedAlert.description && /Area\s+Forecast\s+Discussion/i.test(parsedAlert.description)) {
+                                console.log(`Skipping alert (Area Forecast Discussion in description): ${name || parsedAlert.id}`);
+                                log('Skipping alert (Area Forecast Discussion in description): ' + (name || parsedAlert.id));
+                                return; // skip adding this parsedAlert
+                            }
+                        } catch (e) {
+                            // If the check fails for any reason, continue normal processing
+                        }
                         // Consider a VTEC 'present' only when phenomena and significance are available
                         const hasFullVtec = parsedAlert.properties && parsedAlert.properties.vtec && parsedAlert.properties.vtec.phenomena && parsedAlert.properties.vtec.significance;
                         // Treat an alert as a phenomena match when the alert name contains
