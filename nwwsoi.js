@@ -718,6 +718,12 @@ Louisiana out 20 to 60 NM-`;
                 return;
             }
 
+            // --- Allow alerts with missing or undefined action ---
+            if (!thisObject.action || thisObject.action === 'undefined') {
+                console.log('Alert has no action or action is undefined, allowing it.');
+                thisObject.action = 'default'; // Assign a default action if needed
+            }
+
             // --- Allow alerts with missing VTEC/phenomena/significance if event is allowed ---
             let allowByEvent = false;
             let eventName = null;
@@ -740,7 +746,7 @@ Louisiana out 20 to 60 NM-`;
                             const lines = preamble.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
                             for (let i = 0; i < lines.length; i++) {
                                 // Look for a product code line followed by a headline line
-                                if (/^[A-Z0-9]{3,6}$/.test(lines[i])) {
+                                if (/^[A-Z]{3,6}$/.test(lines[i])) {
                                     const next = lines[i + 1] || '';
                                     if (next) {
                                         const found = allowedAlerts && Array.isArray(allowedAlerts) && allowedAlerts.find(a => {
@@ -1661,7 +1667,7 @@ Louisiana out 20 to 60 NM-`;
                 // Accept optional spaces around the slash and preserve a leading '* ' if present.
                 out = out.replace(/\n{0,2}\s*(\*\s*)?(PRECAUTIONARY\s*\/\s*PREPAREDNESS ACTIONS\.{3,})\s*\n{0,2}/gi, '\n\n$1$2\n\n');
 
-                // Final enforcement: ensure '&&' and '$$' are surrounded by exactly two newlines
+                // Final enforcement: ensure '&&' is surrounded by exactly two newlines
                 // This runs last so earlier replacements can't collapse these separators.
                 out = out.replace(/\n{0,2}&&\n{0,2}/g, '\n\n&&\n\n');
                 out = out.replace(/\n{0,2}\$\$\n{0,2}/g, '\n\n$$$$\n\n');
@@ -1749,6 +1755,9 @@ Louisiana out 20 to 60 NM-`;
                 formatted = formatted.replace(/\n{2,}/g, '\n\n');
                 formatted = formatted.replace(/^\s+|\s+$/g, '');
 
+                // strip any $$ tokens left behind along with trailing text
+                formatted = formatted.replace(/\$\$[^\n]*/g, '');
+
                 return formatted;
             }
 
@@ -1769,6 +1778,10 @@ Louisiana out 20 to 60 NM-`;
 
                 // Replace 2+ spaces with \n
                 msg = msg.replace(/ {2,}/g, '\n');
+
+                // remove any $$ tokens and any text that follows them on the same line
+                // these are usually end-of-message markers such as "$$ DW"
+                msg = msg.replace(/\$\$[^\n]*/g, '');
 
                 // Split at every && or $$, but append the delimiter and its trailing text to the previous part
                 let splitRegex = /(\s*(?:&&|\$\$)[^\s]*)/g;
@@ -2174,7 +2187,7 @@ Louisiana out 20 to 60 NM-`;
                     }
 
                     // Look for a human timestamp after the chosen searchStart (or anywhere if none)
-                    const timeOnlyRe = /(\b(?:\d{1,4}|\d{1,2}:\d{2})\s*(?:AM|PM)\s*(?:PST|PDT|MST|MDT|CST|CDT|EST|EDT|HST|AKST|AKDT|GMT|UTC)?\s*(?:,?\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun))?\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4})/i;
+                    const timeOnlyRe = /(\b(?:\d{1,4}|\d{1,2}:\d{2})\s*(?:AM|PM)\s*(?:PST|PDT|MST|MDT|CST|CDT|EST|EDT|HST|HDT|AKDT|AKST)\s*(?:,?\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun))?\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4})/i;
                     const subTxt = txt.slice(searchStart);
                     const tm = subTxt.match(timeOnlyRe);
                     if (!tm || typeof tm.index !== 'number') return null;
@@ -2243,6 +2256,10 @@ Louisiana out 20 to 60 NM-`;
                     areaDesc: '',
                     properties: props
                 };
+                // strip any $$ tokens that may have survived all previous cleanups
+                if (alertObj.description && typeof alertObj.description === 'string') {
+                    alertObj.description = alertObj.description.replace(/\$\$[^\n]*/g, '').trim();
+                }
                 // Ensure two newlines follow the word 'BULLETIN' (and common misspelling 'BULITTEN')
                     if (alertObj && alertObj.description && typeof alertObj.description === 'string') {
                     alertObj.description = alertObj.description
@@ -2476,7 +2493,14 @@ Louisiana out 20 to 60 NM-`;
                     // Helper: decode common escaped unicode sequences and HTML entities
                     function decodeEscapesAndEntities(s) {
                         if (!s || typeof s !== 'string') return s;
-                        // Convert literal unicode escape sequences like "\u003C" -> '<'
+                        // Normalize escaped newline sequences first (e.g. "\\r\\n", "\\n\\", "\\n")
+                        s = s.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+                        // Remove stray patterns like "\\n\\" -> "\\n"
+                        s = s.replace(/\\n\\/g, '\\n');
+                        // Convert literal "\\n" sequences into actual newlines
+                        s = s.replace(/\\n/g, '\n');
+
+                        // Convert literal unicode escape sequences like "\\u003C" -> '<'
                         s = s.replace(/\\u([0-9a-fA-F]{4})/g, function(_, g) {
                             try { return String.fromCharCode(parseInt(g, 16)); } catch (e) { return '' + _; }
                         });
@@ -2494,7 +2518,8 @@ Louisiana out 20 to 60 NM-`;
                                 default: return m;
                             }
                         });
-                        return s;
+                        // Trim accidental trailing whitespace from lines and normalize non-breaking spaces
+                        return s.replace(/\s+$/gm, '').replace(/\u00A0/g, ' ');
                     }
 
                     // trim any preamble/headers before the first "HEADING..." line to avoid
@@ -2512,7 +2537,7 @@ Louisiana out 20 to 60 NM-`;
                     let cur = null;
 
                     // Collect sections that use the `HEADING...content` style (e.g. "WHAT...", "TORNADO...", "MAX HAIL SIZE...")
-                    for (let rawLine of lines) {
+                        for (let rawLine of lines) {
                         // strip common bullet markers and surrounding whitespace (e.g. "* WHAT...", "- WHAT...", •)
                         const line = rawLine.trim();
                         if (!line) continue;
@@ -2525,7 +2550,8 @@ Louisiana out 20 to 60 NM-`;
                         if (tokens.length > 1) {
                             for (let i = 1; i + 1 < tokens.length; i += 2) {
                                 const heading = tokens[i].toUpperCase();
-                                const content = (tokens[i + 1] || '').trim();
+                                const contentRaw = (tokens[i + 1] || '').trim();
+                                const content = decodeEscapesAndEntities(contentRaw);
                                 if (content) {
                                     secs[heading] = secs[heading] ? (secs[heading] + ' ' + content) : content;
                                 }
@@ -2533,7 +2559,8 @@ Louisiana out 20 to 60 NM-`;
                             }
                         } else if (cur) {
                             // continuation line for current section
-                            secs[cur] = ((secs[cur] || '') + ' ' + stripped).trim();
+                            const cont = decodeEscapesAndEntities(stripped);
+                            secs[cur] = ((secs[cur] || '') + ' ' + cont).trim();
                         }
                     }
 
@@ -2575,32 +2602,25 @@ Louisiana out 20 to 60 NM-`;
                     if (secs['IMPACT']) ai.IMPACT = secs['IMPACT'];
 
                     // damage / threat-specific values (set from headings when present)
-                    // TORNADO should only be set if explicitly found as a heading; clean it to core threat value
-                    if (secs['TORNADO']) {
+                    // Only add a threat key when the decoded source text actually contains
+                    // the corresponding hazard keyword/heading to avoid false positives.
+                    const srcUpper = String(srcText || '').toUpperCase();
+                    if (secs['TORNADO'] && /\bTORNADO\b/i.test(srcText)) {
                         let tornadoVal = secs['TORNADO'].trim().toUpperCase();
-                        // Extract just the threat indicator (POSSIBLE, OBSERVED, RADAR INDICATED, CONFIRMED, etc.)
                         const tornadoMatch = tornadoVal.match(/^(POSSIBLE|OBSERVED|RADAR\s+INDICATED|CONFIRMED|LIKELY)/);
                         ai.TORNADO = tornadoMatch ? tornadoMatch[1] : tornadoVal.split(/[\s\-\$\&]/)[0];
                     }
-                    if (secs['TORNADO DAMAGE THREAT']) ai.TORNADO_DAMAGE_THREAT = secs['TORNADO DAMAGE THREAT'];
-                    if (secs['THUNDERSTORM DAMAGE THREAT']) ai.THUNDERSTORM_DAMAGE_THREAT = secs['THUNDERSTORM DAMAGE THREAT'];
-                    if (secs['FLASH FLOOD DAMAGE THREAT']) ai.FLASH_FLOOD_DAMAGE_THREAT = secs['FLASH FLOOD DAMAGE THREAT'];
+                    if (secs['TORNADO DAMAGE THREAT'] && /\bTORNADO\s*DAMAGE\s*THREAT\b/i.test(srcText)) ai.TORNADO_DAMAGE_THREAT = secs['TORNADO DAMAGE THREAT'];
+                    if (secs['THUNDERSTORM DAMAGE THREAT'] && /\bTHUNDERSTORM\b/i.test(srcText)) ai.THUNDERSTORM_DAMAGE_THREAT = secs['THUNDERSTORM DAMAGE THREAT'];
+                    if (secs['FLASH FLOOD DAMAGE THREAT'] && /\bFLASH\s*FLOOD\b/i.test(srcText)) ai.FLASH_FLOOD_DAMAGE_THREAT = secs['FLASH FLOOD DAMAGE THREAT'];
 
-                    // new threat fields requested by user
-                    if (secs['HAIL THREAT']) ai.HAIL_THREAT = secs['HAIL THREAT'];
-                    if (secs['WIND THREAT']) ai.WIND_THREAT = secs['WIND THREAT'];
-                    if (secs['FLASH FLOOD']) ai.FLASH_FLOOD = secs['FLASH FLOOD'];
+                    // new threat fields requested by user; only add when keyword present
+                    if (secs['HAIL THREAT'] && /\bHAIL\b/i.test(srcText)) ai.HAIL_THREAT = secs['HAIL THREAT'];
+                    if (secs['WIND THREAT'] && /\bWIND\b/i.test(srcText)) ai.WIND_THREAT = secs['WIND THREAT'];
+                    if (secs['FLASH FLOOD'] && /\bFLASH\s*FLOOD\b/i.test(srcText)) ai.FLASH_FLOOD = secs['FLASH FLOOD'];
 
-                    // promote damage-threat -> short-form keys when only the damage-form is present
-                    // (HAIL_DAMAGE_THREAT and WIND_DAMAGE_THREAT are not used)
-
-                    // Also ensure common threats appear under both long and short names
-                    if (!ai.TORNADO_DAMAGE_THREAT && ai.TORNADO) ai.TORNADO_DAMAGE_THREAT = ai.TORNADO;
-                    if (!ai.TORNADO && ai.TORNADO_DAMAGE_THREAT) ai.TORNADO = ai.TORNADO_DAMAGE_THREAT;
-                    if (!ai.THUNDERSTORM_DAMAGE_THREAT && ai.THUNDERSTORM) ai.THUNDERSTORM_DAMAGE_THREAT = ai.THUNDERSTORM;
-                    if (!ai.THUNDERSTORM && ai.THUNDERSTORM_DAMAGE_THREAT) ai.THUNDERSTORM = ai.THUNDERSTORM_DAMAGE_THREAT;
-                    if (!ai.FLASH_FLOOD_DAMAGE_THREAT && ai.FLASH_FLOOD) ai.FLASH_FLOOD_DAMAGE_THREAT = ai.FLASH_FLOOD;
-                    if (!ai.FLASH_FLOOD && ai.FLASH_FLOOD_DAMAGE_THREAT) ai.FLASH_FLOOD = ai.FLASH_FLOOD_DAMAGE_THREAT;
+                    // Do not auto-promote between long and short threat names; only keep
+                    // keys that were explicitly present or captured by targeted fallbacks.
 
                     // numeric measurements (accept values from section headings)
                     if (secs['MAX HAIL SIZE'] || secs['MAX HAIL']) ai.MAX_HAIL_SIZE = fmtHail(secs['MAX HAIL SIZE'] || secs['MAX HAIL']);
@@ -2623,22 +2643,35 @@ Louisiana out 20 to 60 NM-`;
                     // Broad fallback: catch cases where the separator or comparator may be encoded
                     fallbackSet('MAX_WIND_GUST', /MAX\s*WIND(?:\s*GUST)?[\s\S]{0,30}?([<>~]?\s*[0-9]{1,3})/i, fmtWind);
 
-                    // Threat fallbacks: HAIL / WIND / FLASH FLOOD (accept both "THREAT" and "DAMAGE THREAT")
+                    // Threat fallbacks: only apply fallback extraction when the corresponding
+                    // keyword actually appears in the message text. This avoids adding
+                    // threat fields when the message doesn't mention that hazard.
                     const hailThreatRe = /HAIL(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i;
                     const windThreatRe = /WIND(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i;
-                    const flashThreatRe = /FLASH\s*FLOOD(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i;
 
-                    fallbackSet('HAIL_THREAT', hailThreatRe, s => s.trim());
-                    fallbackSet('WIND_THREAT', windThreatRe, s => s.trim());
+                    const hasTornado = /\bTORNADO\b/i.test(full);
+                    const hasHail = /\bHAIL\b/i.test(full);
+                    const hasWind = /\bWIND\b/i.test(full);
+                    const hasFlash = /\bFLASH\s*FLOOD\b/i.test(full);
+                    const hasThunder = /\bTHUNDERSTORM\b/i.test(full);
+
+                    if (hasHail) fallbackSet('HAIL_THREAT', hailThreatRe, s => s.trim());
+                    if (hasWind) fallbackSet('WIND_THREAT', windThreatRe, s => s.trim());
                     // Thunderstorm damage threat: similar fallback when explicit heading wasn't parsed
-                    fallbackSet('THUNDERSTORM_DAMAGE_THREAT', /THUNDERSTORM(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i, s => s.trim());
+                    if (hasThunder) fallbackSet('THUNDERSTORM_DAMAGE_THREAT', /THUNDERSTORM(?:\s+(?:DAMAGE\s+)?THREAT(?:\(S\))?)?\.{2,}\s*([A-Z][A-Z\s\-]+)/i, s => s.trim());
                     // NOTE: Do NOT add fallback for FLASH_FLOOD_DAMAGE_THREAT — only use explicit headings
 
-                    // Also populate short-form FLASH_FLOOD if present as a heading or sentence
-                    // Only capture core threat indicators (OBSERVED, RADAR INDICATED, etc.), not trailing text
-                    if (!ai.FLASH_FLOOD) {
+                    // Also populate short-form FLASH_FLOOD only if the message mentions flash flood
+                    if (hasFlash && !ai.FLASH_FLOOD) {
                         const mff = full.match(/(^|\n)FLASH\s*FLOOD(?:\s*[:\.]|\s+)([A-Z][A-Z\s\-]{0,40}?)(?=\s*$|\s*\n|(?:\s+(?:IN|AT|WILL|FOR|FROM|TO)))/i);
                         if (mff && mff[2]) ai.FLASH_FLOOD = mff[2].trim();
+                    }
+
+                    // Also attempt to populate `TORNADO` from inline sentences when not set by headings
+                    // but only if the message actually contains the word "TORNADO".
+                    if (!ai.TORNADO && hasTornado) {
+                        const mt = full.match(/(^|\n)TORNADO(?:\s*[:\.]|\s+)([A-Z][A-Z\s\-]{0,40}?)(?=\s*$|\s*\n|(?:\s+(?:IN|AT|WILL|FOR|FROM|TO)))/i);
+                        if (mt && mt[2]) ai.TORNADO = mt[2].trim();
                     }
 
                     // attach under the exact name the request used (only keys with values are present)
